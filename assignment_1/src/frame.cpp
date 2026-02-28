@@ -11,13 +11,14 @@ namespace {
 constexpr uint8_t kSof0 = 0xA5;
 constexpr uint8_t kSof1 = 0x5A;
 
-void AppendLe16(std::vector<uint8_t>& out, uint16_t v) {
+void AppendLe16(std::vector<uint8_t> &out, uint16_t v) {
   out.push_back(static_cast<uint8_t>(v & 0xFF));
   out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
 }
 
-uint16_t ReadLe16(const std::vector<uint8_t>& in, size_t offset) {
-  return static_cast<uint16_t>(in[offset]) | (static_cast<uint16_t>(in[offset + 1]) << 8);
+uint16_t ReadLe16(const std::vector<uint8_t> &in, size_t offset) {
+  return static_cast<uint16_t>(in[offset]) |
+         (static_cast<uint16_t>(in[offset + 1]) << 8);
 }
 
 bool IsHexChar(char c) {
@@ -25,25 +26,37 @@ bool IsHexChar(char c) {
 }
 
 int HexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= '0' && c <= '9')
+    return c - '0';
   c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'a' && c <= 'f')
+    return 10 + (c - 'a');
   return -1;
 }
 
-}  // namespace
+} // namespace
 
-uint16_t Crc16Ccitt(const uint8_t* data, size_t len) {
+uint16_t Crc16Ccitt(const uint8_t *data, size_t len) {
   // TODO: 实现 CRC16-CCITT。
   // 参数：poly=0x1021, init=0xFFFF。
-  // CRC 必须覆盖 version..payload 这些字节（即 SOF 之后、crc16 之前的全部内容）。
-  // 单元测试依赖这一点。
-  (void)data;
-  (void)len;
-  return 0;
+  // CRC 必须覆盖 version..payload 这些字节（即 SOF 之后、crc16
+  // 之前的全部内容）。 单元测试依赖这一点。
+  uint16_t crc = 0xFFFF;
+  uint16_t poly = 0x1021;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= (static_cast<uint16_t>(data[i]) << 8);
+    for (int j = 0; j < 8; j++) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ poly;
+      } else {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
 }
 
-std::vector<uint8_t> Encode(const Frame& f) {
+std::vector<uint8_t> Encode(const Frame &f) {
   // TODO: 将 Frame 序列化为线上的 wire 格式。
   // Wire 格式（字段为小端序 little-endian）：
   //   SOF[2] = 0xA5 0x5A
@@ -66,13 +79,59 @@ std::vector<uint8_t> Encode(const Frame& f) {
   AppendLe16(out, f.seq);
   out.push_back(f.type);
   out.insert(out.end(), f.payload.begin(), f.payload.end());
-
+  uint16_t crc = Crc16Ccitt(out.data() + 2, out.size() - 2);
+  AppendLe16(out, crc);
   // TODO: 替换为真实的 CRC。
-  AppendLe16(out, 0);
   return out;
 }
 
-bool TryDecode(std::vector<uint8_t>& buffer, Frame& out) {
+bool TryDecode(std::vector<uint8_t> &buffer, Frame &out) {
+  while (buffer.size() >= 2) {
+    size_t psof = 0;
+    bool f = false;
+    for (; psof < buffer.size() - 1; ++psof) {
+      if (buffer[psof] == kSof0 && buffer[psof + 1] == kSof1) {
+        f = true;
+        break;
+      }
+    }
+    if (!f) {
+      return f;
+    }
+    if (psof != 0) {
+      buffer.erase(buffer.begin(), buffer.begin() + psof);
+      continue;
+    }
+    if (buffer.size() < 7) {
+      return false;
+    }
+    uint16_t payload_len = ReadLe16(buffer, 3);
+    if (payload_len > 65535) {
+      buffer.erase(buffer.begin());
+      continue;
+    }
+    size_t total_len = 2 + 1 + 2 + 2 + 1 + payload_len + 2;
+    if (buffer.size() < total_len) {
+      return false;
+    }
+    size_t crc_len = 1 + 2 + 2 + 1 + payload_len;
+    uint16_t CRC = ReadLe16(buffer, total_len - 2);
+    uint16_t actual_crc = Crc16Ccitt(buffer.data() + 2, crc_len);
+    if (CRC != actual_crc) {
+      buffer.erase(buffer.begin());
+      continue;
+    }
+    out.version = buffer[2];
+    out.seq = ReadLe16(buffer, 5);
+    out.type = buffer[7];
+    out.payload.clear();
+    for (size_t i = 0; i < payload_len; i++) {
+      out.payload.push_back(buffer[8 + i]);
+    }
+    buffer.erase(buffer.begin(), buffer.begin() + total_len);
+    return true;
+  }
+  return false;
   // TODO: 流式解析器。
   // 需求（见 README + 测试）：
   // - buffer 是字节流，开头可能包含垃圾数据。
@@ -80,12 +139,9 @@ bool TryDecode(std::vector<uint8_t>& buffer, Frame& out) {
   // - 若不足以组成完整帧：返回 false，并保持 buffer 不变。
   // - 若候选帧 CRC 错误 / 长度非法：丢弃部分字节并继续搜索（必须避免死循环）。
   // - 成功时：填充 out，从 buffer 中擦除已消费的字节，并返回 true。
-  (void)buffer;
-  (void)out;
-  return false;
 }
 
-bool ParseHexBytes(const std::string& text, std::vector<uint8_t>& out) {
+bool ParseHexBytes(const std::string &text, std::vector<uint8_t> &out) {
   // 支持：
   // - "A5 5A 01 00"（空格分隔）
   // - "A5,5A,01,00"（逗号分隔）
@@ -108,19 +164,24 @@ bool ParseHexBytes(const std::string& text, std::vector<uint8_t>& out) {
 
   while (true) {
     skip_sep();
-    if (i >= text.size()) break;
+    if (i >= text.size())
+      break;
 
     // 可选的 0x 前缀（仅当其严格以 "0x"/"0X" 形式出现时）。
-    if (text[i] == '0' && (i + 1) < text.size() && (text[i + 1] == 'x' || text[i + 1] == 'X')) {
+    if (text[i] == '0' && (i + 1) < text.size() &&
+        (text[i + 1] == 'x' || text[i + 1] == 'X')) {
       i += 2;
     }
 
-    if ((i + 1) >= text.size()) return false;
-    if (!IsHexChar(text[i]) || !IsHexChar(text[i + 1])) return false;
+    if ((i + 1) >= text.size())
+      return false;
+    if (!IsHexChar(text[i]) || !IsHexChar(text[i + 1]))
+      return false;
 
     int hi = HexVal(text[i]);
     int lo = HexVal(text[i + 1]);
-    if (hi < 0 || lo < 0) return false;
+    if (hi < 0 || lo < 0)
+      return false;
 
     out.push_back(static_cast<uint8_t>((hi << 4) | lo));
     i += 2;
@@ -129,14 +190,15 @@ bool ParseHexBytes(const std::string& text, std::vector<uint8_t>& out) {
   return true;
 }
 
-std::string ToHex(const std::vector<uint8_t>& bytes) {
+std::string ToHex(const std::vector<uint8_t> &bytes) {
   std::ostringstream oss;
   oss << std::hex << std::setfill('0');
   for (size_t i = 0; i < bytes.size(); ++i) {
-    if (i) oss << ' ';
+    if (i)
+      oss << ' ';
     oss << std::setw(2) << static_cast<int>(bytes[i]);
   }
   return oss.str();
 }
 
-}  // namespace rmproto
+} // namespace rmproto
